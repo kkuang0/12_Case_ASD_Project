@@ -16,7 +16,9 @@ from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 import torchvision
 import io
-from tqdm import tqdm  # <-- Added import
+from tqdm import tqdm  
+import torch.nn.functional as F
+from torch.utils.tensorboard.summary import hparams  
 
 class AxonDataset(Dataset):
     def __init__(self, metadata_df, base_dir, transform=None, augment=None):
@@ -89,19 +91,19 @@ class MultiTaskCNN(nn.Module):
             nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Dropout2d(0.25),
+            nn.Dropout2d(0.4),
             
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Dropout2d(0.25),
+            nn.Dropout2d(0.4),
             
             nn.Conv2d(128, 256, kernel_size=3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Dropout2d(0.25)
+            nn.Dropout2d(0.4)
         )
         
         # Task-specific heads
@@ -231,6 +233,42 @@ class Trainer:
             
             self.writer.add_image(f'{task}/confusion_matrix', img, epoch)
             plt.close()
+    
+    def log_model_weights_and_grads(self, epoch):
+        """
+        Log histograms of the parameters and their gradients.
+        """
+        for name, param in self.model.named_parameters():
+            # Log parameter values
+            self.writer.add_histogram(f'weights/{name}', param, epoch)
+            # Log gradients (if they exist)
+            if param.grad is not None:
+                self.writer.add_histogram(f'grads/{name}', param.grad, epoch)
+    def log_pr_curves(self, predictions, targets, epoch, prefix=''):
+        """
+        Log precision-recall curves for each task, if multi-class we do it for class 0 or 1, 
+        you can adapt for each class as needed.
+        """
+        for task in ['condition', 'region', 'depth']:
+            # predictions[task]: shape (B, C)
+            # We pick out class=1 for binary tasks or any single class for multi-class
+            preds_softmax = F.softmax(predictions[task], dim=1)
+            # Let's just pick the probability of 'class 1' for demonstration
+            if preds_softmax.shape[1] > 1:
+                positive_probs = preds_softmax[:, 1]
+            else:
+                positive_probs = preds_softmax[:, 0]
+            
+            # Ground truth for the relevant class
+            # For binary, `targets[task]` is 0/1
+            # For multi-class, you'd do one-vs-rest as needed. 
+            # We'll assume binary or picking the '1' class.
+            self.writer.add_pr_curve(
+                f'{prefix}PR/{task}', 
+                labels=targets[task], 
+                predictions=positive_probs, 
+                global_step=epoch
+            )
     
     def train_epoch(self, epoch):
         self.model.train()
@@ -421,50 +459,36 @@ class Trainer:
         return self.history
 
 def main():
-    # Set random seeds for reproducibility
     torch.manual_seed(42)
     random.seed(42)
     np.random.seed(42)
     
-    # Set base directory (this should be the directory containing the Images folder)
-    base_dir = Path("C:/Kelvin_ASD_v2")  # Adjust this to your actual path
-    
-    # Load metadata
+    base_dir = Path("C:/Kelvin_ASD_v2")  # Adjust this path as needed
     metadata_df = pd.read_csv('metadata/dataset_metadata.csv')
     
-    # Setup transforms
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485], std=[0.229])
     ])
     
-    # Create datasets
     train_data = metadata_df[metadata_df['split'] == 'train']
     val_data = metadata_df[metadata_df['split'] == 'test']
     
-    # Pass the base directory to the datasets
     train_dataset = AxonDataset(train_data, base_dir, transform=transform)
     val_dataset = AxonDataset(val_data, base_dir, transform=transform)
     
-    # Create dataloaders
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
     
-    # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Initialize model
     model = MultiTaskCNN().to(device)
     
-    # Setup loss and optimizer
     criterion = MultiTaskLoss(weights={'condition': 1.0, 'region': 1.0, 'depth': 1.0})
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
-    # Create experiment name
     exp_name = f"multitask_cnn_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
-    # Create trainer and train
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
@@ -477,7 +501,6 @@ def main():
         exp_name=exp_name
     )
     
-    # Train model
     history = trainer.train()
 
 if __name__ == "__main__":
